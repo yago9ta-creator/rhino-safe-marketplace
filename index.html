@@ -1,0 +1,999 @@
+<html lang="pt-BR"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rhino Safe - Marketplace de HDs e Equipamentos</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #f5f5f5;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px 20px;
+            text-align: center;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .logo {
+            font-size: 2rem;
+            font-weight: bold;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .header p {
+            font-size: 1rem;
+            opacity: 0.95;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        .filters {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .filters h3 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 1.3rem;
+        }
+
+        .filter-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .filter-btn {
+            padding: 10px 20px;
+            border: 2px solid #667eea;
+            background: white;
+            color: #667eea;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 0.95rem;
+            font-weight: 500;
+        }
+
+        .filter-btn:hover, .filter-btn.active {
+            background: #667eea;
+            color: white;
+            transform: translateY(-2px);
+        }
+
+        .products-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 30px;
+            margin-top: 30px;
+        }
+
+        .product-card {
+            background: white;
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            transition: all 0.3s ease;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .product-card:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.2);
+        }
+
+        .product-image {
+            background: linear-gradient(135deg, #667eea20 0%, #764ba220 100%);
+            padding: 40px;
+            text-align: center;
+            font-size: 4rem;
+            height: 200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .product-info {
+            padding: 25px;
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .product-category {
+            color: #667eea;
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+
+        .product-title {
+            font-size: 1.3rem;
+            font-weight: bold;
+            color: #2d3748;
+            margin-bottom: 10px;
+        }
+
+        .product-description {
+            color: #666;
+            font-size: 0.95rem;
+            margin-bottom: 15px;
+            line-height: 1.6;
+            flex-grow: 1;
+        }
+
+        .product-specs {
+            background: #f8f9fa;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+        }
+
+        .product-specs div {
+            margin: 5px 0;
+            color: #555;
+        }
+
+        .price-section {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .price {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .price-note {
+            font-size: 0.85rem;
+            color: #666;
+            font-style: italic;
+        }
+
+        .cta-button {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            background: #25D366;
+            color: white;
+            padding: 15px 25px;
+            text-decoration: none;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: bold;
+            transition: all 0.3s ease;
+            border: none;
+            cursor: pointer;
+            text-align: center;
+        }
+
+        .cta-button:hover {
+            background: #128C7E;
+            transform: scale(1.05);
+        }
+
+        .floating-whatsapp {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: #25D366;
+            color: white;
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2rem;
+            box-shadow: 0 4px 15px rgba(37, 211, 102, 0.4);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            z-index: 1000;
+            text-decoration: none;
+        }
+
+        .floating-whatsapp:hover {
+            transform: scale(1.1);
+            box-shadow: 0 6px 20px rgba(37, 211, 102, 0.6);
+        }
+
+        .features {
+            background: white;
+            padding: 40px;
+            border-radius: 15px;
+            margin: 40px 0;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .features h2 {
+            text-align: center;
+            color: #667eea;
+            font-size: 2rem;
+            margin-bottom: 30px;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 25px;
+        }
+
+        .feature-item {
+            text-align: center;
+            padding: 20px;
+            border-radius: 10px;
+            background: #f8f9fa;
+        }
+
+        .feature-icon {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+
+        .feature-item h3 {
+            color: #667eea;
+            margin-bottom: 8px;
+        }
+
+        footer {
+            background: #2d3748;
+            color: white;
+            text-align: center;
+            padding: 30px 20px;
+            margin-top: 60px;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        @media (max-width: 768px) {
+            .logo {
+                font-size: 1.5rem;
+            }
+
+            .products-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .filter-buttons {
+                flex-direction: column;
+            }
+
+            .filter-btn {
+                width: 100%;
+            }
+        }
+    </style>
+<style>
+            @keyframes fadeIn {
+                from {
+                    opacity: 0;
+                    transform: translateY(20px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+        </style></head>
+<body id="artifacts-component-root-html">
+    <header class="header">
+        <div class="logo">🦏 RHINO SAFE</div>
+        <p>Marketplace de HDs e Equipamentos - Melhores Preços e Qualidade</p>
+    </header>
+
+    <div class="container">
+        <div class="filters">
+            <h3>🔍 Filtrar Produtos</h3>
+            <div class="filter-buttons">
+                <button class="filter-btn active" data-category="all">Todos os Produtos</button>
+                <button class="filter-btn" data-category="hd-interno">HDs Internos</button>
+                <button class="filter-btn" data-category="hd-externo">HDs Externos</button>
+                <button class="filter-btn" data-category="hd-purple">HD Purple</button>
+                <button class="filter-btn" data-category="notebook">Notebooks</button>
+                <button class="filter-btn" data-category="hd-notebook">HDs Notebook</button>
+                <button class="filter-btn" data-category="mini-pc">Mini PC</button>
+            </div>
+        </div>
+
+        <div class="products-grid" id="productsGrid">
+            <!-- HDs Internos -->
+            <div class="product-card" data-category="hd-interno">
+                <div class="product-image">💾</div>
+                <div class="product-info">
+                    <div class="product-category">HD Interno</div>
+                    <div class="product-title">HD Seagate BarraCuda 1TB</div>
+                    <div class="product-description">Ideal para PCs desktop com alta performance de 7200 RPM</div>
+                    <div class="product-specs">
+                        <div>✓ Capacidade: 1TB</div>
+                        <div>✓ Velocidade: 7200 RPM</div>
+                        <div>✓ Interface: SATA III</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 349,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para HD Seagate BarraCuda 1TB" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <div class="product-card" data-category="hd-interno">
+                <div class="product-image">💾</div>
+                <div class="product-info">
+                    <div class="product-category">HD Interno</div>
+                    <div class="product-title">HD Western Digital Blue 2TB</div>
+                    <div class="product-description">Confiável e eficiente para armazenamento em massa</div>
+                    <div class="product-specs">
+                        <div>✓ Capacidade: 2TB</div>
+                        <div>✓ Velocidade: 5400 RPM</div>
+                        <div>✓ Cache: 256MB</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 534,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para HD WD Blue 2TB" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <!-- HDs Externos -->
+            <div class="product-card" data-category="hd-externo">
+                <div class="product-image">🔌</div>
+                <div class="product-info">
+                    <div class="product-category">HD Externo</div>
+                    <div class="product-title">HD Externo Seagate 1TB</div>
+                    <div class="product-description">Portátil e seguro para backups com USB 3.0</div>
+                    <div class="product-specs">
+                        <div>✓ Capacidade: 1TB</div>
+                        <div>✓ Conexão: USB 3.0</div>
+                        <div>✓ Compatível: Windows/Mac</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 379,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para HD Externo Seagate 1TB" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <div class="product-card" data-category="hd-externo">
+                <div class="product-image">🔌</div>
+                <div class="product-info">
+                    <div class="product-category">HD Externo</div>
+                    <div class="product-title">HD Externo WD Elements 2TB</div>
+                    <div class="product-description">Alta capacidade para armazenamento portátil</div>
+                    <div class="product-specs">
+                        <div>✓ Capacidade: 2TB</div>
+                        <div>✓ Conexão: USB 3.0</div>
+                        <div>✓ Plug and Play</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 549,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para HD Externo WD Elements 2TB" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <!-- HDs Purple -->
+            <div class="product-card" data-category="hd-purple">
+                <div class="product-image">🟣</div>
+                <div class="product-info">
+                    <div class="product-category">HD Purple Vigilância</div>
+                    <div class="product-title">WD Purple 1TB Surveillance</div>
+                    <div class="product-description">Projetado para sistemas de vigilância 24/7 com tecnologia AllFrame</div>
+                    <div class="product-specs">
+                        <div>✓ Capacidade: 1TB</div>
+                        <div>✓ Suporta até 64 câmeras</div>
+                        <div>✓ Otimizado para gravação contínua</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 502,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para WD Purple 1TB" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <div class="product-card" data-category="hd-purple">
+                <div class="product-image">🟣</div>
+                <div class="product-info">
+                    <div class="product-category">HD Purple Vigilância</div>
+                    <div class="product-title">WD Purple 2TB Surveillance</div>
+                    <div class="product-description">Para sistemas de vigilância profissionais de maior porte</div>
+                    <div class="product-specs">
+                        <div>✓ Capacidade: 2TB</div>
+                        <div>✓ Workload: 180TB/ano</div>
+                        <div>✓ Cache: 256MB</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 709,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para WD Purple 2TB" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <!-- Notebooks -->
+            <div class="product-card" data-category="notebook">
+                <div class="product-image">💻</div>
+                <div class="product-info">
+                    <div class="product-category">Notebook</div>
+                    <div class="product-title">Lenovo IdeaPad 1i</div>
+                    <div class="product-description">Ideal para trabalho e estudos com design ultrafino</div>
+                    <div class="product-specs">
+                        <div>✓ Intel Core i3</div>
+                        <div>✓ 8GB RAM</div>
+                        <div>✓ SSD 256GB</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 2.399,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para Notebook Lenovo IdeaPad 1i" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <div class="product-card" data-category="notebook">
+                <div class="product-image">💻</div>
+                <div class="product-info">
+                    <div class="product-category">Notebook</div>
+                    <div class="product-title">Dell Inspiron 15 i5</div>
+                    <div class="product-description">Performance superior para multitarefas</div>
+                    <div class="product-specs">
+                        <div>✓ Intel Core i5 12ª Geração</div>
+                        <div>✓ 8GB RAM</div>
+                        <div>✓ SSD 512GB</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 3.300,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para Dell Inspiron 15 i5" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <div class="product-card" data-category="notebook">
+                <div class="product-image">💻</div>
+                <div class="product-info">
+                    <div class="product-category">Notebook</div>
+                    <div class="product-title">Samsung Galaxy Book4</div>
+                    <div class="product-description">Design elegante com tela Full HD</div>
+                    <div class="product-specs">
+                        <div>✓ Intel Core i5</div>
+                        <div>✓ 8GB RAM</div>
+                        <div>✓ SSD 256GB</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 2.700,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para Samsung Galaxy Book4" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <!-- HDs de Notebook -->
+            <div class="product-card" data-category="hd-notebook">
+                <div class="product-image">🔧</div>
+                <div class="product-info">
+                    <div class="product-category">HD Notebook</div>
+                    <div class="product-title">SSD Kingston 240GB</div>
+                    <div class="product-description">Upgrade perfeito para acelerar seu notebook</div>
+                    <div class="product-specs">
+                        <div>✓ Capacidade: 240GB</div>
+                        <div>✓ Interface: SATA III</div>
+                        <div>✓ Leitura: 500MB/s</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 189,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para SSD Kingston 240GB" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <div class="product-card" data-category="hd-notebook">
+                <div class="product-image">🔧</div>
+                <div class="product-info">
+                    <div class="product-category">HD Notebook</div>
+                    <div class="product-title">HD Notebook Seagate 1TB</div>
+                    <div class="product-description">Expansão de armazenamento para notebooks</div>
+                    <div class="product-specs">
+                        <div>✓ Capacidade: 1TB</div>
+                        <div>✓ Formato: 2.5"</div>
+                        <div>✓ Interface: SATA III</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 289,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para HD Notebook Seagate 1TB" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <!-- Mini PCs -->
+            <div class="product-card" data-category="mini-pc">
+                <div class="product-image">🖥️</div>
+                <div class="product-info">
+                    <div class="product-category">Mini PC</div>
+                    <div class="product-title">Mini PC Intel Core i3</div>
+                    <div class="product-description">Compacto e eficiente para escritórios</div>
+                    <div class="product-specs">
+                        <div>✓ Intel Core i3</div>
+                        <div>✓ 8GB RAM</div>
+                        <div>✓ SSD 256GB</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 1.899,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para Mini PC Intel Core i3" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+
+            <div class="product-card" data-category="mini-pc">
+                <div class="product-image">🖥️</div>
+                <div class="product-info">
+                    <div class="product-category">Mini PC</div>
+                    <div class="product-title">Mini PC Intel Core i5</div>
+                    <div class="product-description">Performance superior em espaço reduzido</div>
+                    <div class="product-specs">
+                        <div>✓ Intel Core i5</div>
+                        <div>✓ 8GB RAM</div>
+                        <div>✓ SSD 512GB</div>
+                    </div>
+                    <div class="price-section">
+                        <div class="price">R$ 2.599,00</div>
+                        <div class="price-note">*Preço médio de mercado</div>
+                    </div>
+                    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de um orçamento para Mini PC Intel Core i5" class="cta-button">
+                        📱 Solicitar Orçamento
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <div class="features">
+            <h2>Por Que Escolher a Rhino Safe?</h2>
+            <div class="features-grid">
+                <div class="feature-item">
+                    <div class="feature-icon">✅</div>
+                    <h3>Qualidade Garantida</h3>
+                    <p>Produtos de marcas reconhecidas</p>
+                </div>
+                <div class="feature-item">
+                    <div class="feature-icon">💰</div>
+                    <h3>Melhor Preço</h3>
+                    <p>Preços competitivos do mercado</p>
+                </div>
+                <div class="feature-item">
+                    <div class="feature-icon">🚀</div>
+                    <h3>Entrega Rápida</h3>
+                    <p>Agilidade no atendimento</p>
+                </div>
+                <div class="feature-item">
+                    <div class="feature-icon">🛡️</div>
+                    <h3>Suporte Especializado</h3>
+                    <p>Assessoria técnica completa</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <a href="https://wa.me/5511910901995?text=Olá! Gostaria de fazer um orçamento" class="floating-whatsapp" title="Fale conosco no WhatsApp">
+        📱
+    </a>
+
+    <footer>
+        <p>© 2024 Rhino Safe - Todos os direitos reservados</p>
+        <p>Especialistas em Armazenamento de Dados</p>
+        <p style="margin-top: 10px;">📱 WhatsApp: (11) 91090-1995</p>
+    </footer>
+
+    <!-- Botão de Download -->
+    <div style="position: fixed; top: 20px; right: 20px; z-index: 1001;">
+        <button onclick="downloadHTML()" style="background: #667eea; color: white; padding: 12px 24px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+            ⬇️ Baixar HTML
+        </button>
+    </div>
+
+    <script>
+        // Função de download
+        function downloadHTML() {
+            const htmlContent = document.documentElement.outerHTML;
+            const blob = new Blob([htmlContent], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'rhino-safe-marketplace.html';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        // Sistema de filtros
+        const filterButtons = document.querySelectorAll('.filter-btn');
+        const productCards = document.querySelectorAll('.product-card');
+
+        filterButtons.forEach(button => {
+            button.addEventListener('click', () => {
+                // Remove active de todos os botões
+                filterButtons.forEach(btn => btn.classList.remove('active'));
+                // Adiciona active no botão clicado
+                button.classList.add('active');
+
+                const category = button.getAttribute('data-category');
+
+                productCards.forEach(card => {
+                    if (category === 'all' || card.getAttribute('data-category') === category) {
+                        card.style.display = 'flex';
+                        card.style.animation = 'fadeIn 0.5s ease';
+                    } else {
+                        card.style.display = 'none';
+                    }
+                });
+            });
+        });
+
+        // Animação de fade in
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes fadeIn {
+                from {
+                    opacity: 0;
+                    transform: translateY(20px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    </script>
+
+</body></html>
