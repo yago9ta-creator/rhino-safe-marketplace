@@ -3,8 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <img src="logo.png" alt="Rhino Safe Logo" class="rhino-logo">
-  <title>Rhino Safe - Marketplace de HDs e Equipamentos</title>
+    <title>Rhino Safe - Marketplace de HDs e Equipamentos</title>
     <style>
         * {
             margin: 0;
@@ -32,15 +31,22 @@
 
         .logo-container {
             display: flex;
+            flex-direction: row;
             align-items: center;
             justify-content: center;
             gap: 15px;
             margin-bottom: 10px;
         }
 
-        .rhino-icon {
-            width: 50px;
-            height: 50px;
+        .rhino-logo-full {
+            width: 60px;
+            height: auto;
+        }
+
+        .logo-text {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
         }
 
         .logo {
@@ -334,10 +340,11 @@
 <body>
     <header class="header">
         <div class="logo-container">
-            <svg class="rhino-icon" viewBox="0 0 400 300" fill="white">
-                <path d="M350 180c0-10-5-20-10-28-8-12-18-22-30-30-15-10-32-18-50-22-20-5-40-7-60-5-18 2-35 7-50 15-12 6-23 14-32 24-8 8-14 18-18 28-3 8-5 17-5 26 0 15 5 30 13 42 10 15 24 27 40 35 18 9 38 14 58 14 22 0 44-6 63-16 16-9 30-21 40-36 8-12 13-26 13-40 0-2 0-5-1-7zm-90-60c8 0 15 2 22 5 6 3 11 7 15 12 4 5 6 11 6 17 0 8-3 15-8 21-6 6-13 10-21 12-9 2-18 2-27 0-8-2-15-6-21-12-5-6-8-13-8-21 0-6 2-12 6-17 4-5 9-9 15-12 7-3 14-5 21-5z"/>
-            </svg>
-            <div>
+            <!-- Logo pequena -->
+            <img src="logo.png" alt="Rhino Safe Logo" class="rhino-logo-full">
+            
+            <!-- Texto ao lado -->
+            <div class="logo-text">
                 <div class="logo">RHINO SAFE</div>
                 <div class="logo-subtitle">Distribuidora</div>
             </div>
